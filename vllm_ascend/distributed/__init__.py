@@ -26,3 +26,12 @@ KVConnectorFactory.register_connector(
 KVConnectorFactory.register_connector(
     "MooncakeConnectorV1", "vllm_ascend.distributed.mooncake_connector",
     "MooncakeConnector")
+
+from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+from collections import defaultdict
+
+def patched_init(self, world_size: int):
+    self._recv_remaining_count = defaultdict[str, int](lambda: 1)
+    self._send_remaining_count = defaultdict[str, int](lambda: 1)
+
+KVOutputAggregator.__init__ = patched_init

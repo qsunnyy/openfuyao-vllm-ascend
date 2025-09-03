@@ -84,7 +84,7 @@ class AscendScheduler(Scheduler):
         # Use a temporary deque to collect requests that need to be skipped
         # and put back at the head of the waiting queue later
         skipped_waiting_requests: deque[Request] = deque()
-
+        self.waiting = deque(sorted(self.waiting, key=lambda x: x.num_prompt_tokens))
         # Schedule prefill requests first.
         while self.waiting and token_budget > 0:
             if len(self.running) == self.max_num_running_reqs:

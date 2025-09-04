@@ -468,6 +468,11 @@ async def _handle_completions(api: str, request: Request):
         prefiller_idx = proxy_state.select_prefiller(group_id, prefiller_score)
         prefiller = proxy_state.groups[group_id]["prefillers"][prefiller_idx]
 
+        if "max_completion_tokens" in req_data:
+            max_completion_tokens = req_data.pop("max_completion_tokens")
+            req_data["max_tokens"] = max_completion_tokens
+        print(f"############ req_data: {req_data} ###############")
+
         response = await send_request_to_service(
             prefiller.client,
             group_id,

@@ -32,6 +32,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.ascend_config import get_ascend_config
 
 if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -84,7 +85,10 @@ class AscendScheduler(Scheduler):
         # Use a temporary deque to collect requests that need to be skipped
         # and put back at the head of the waiting queue later
         skipped_waiting_requests: deque[Request] = deque()
-        self.waiting = deque(sorted(self.waiting, key=lambda x: x.num_prompt_tokens))
+
+        batch_by_request_length = get_ascend_config().batch_by_request_length
+        if batch_by_request_length:
+            self.waiting = deque(sorted(self.waiting, key=lambda x: x.num_prompt_tokens))
         # Schedule prefill requests first.
         while self.waiting and token_budget > 0:
             if len(self.running) == self.max_num_running_reqs:

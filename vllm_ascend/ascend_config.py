@@ -61,6 +61,7 @@ class AscendConfig:
                 raise AssertionError(
                     "lmhead_tensor_parallel_size is only supported in the pure DP scenario"
                 )
+        self.batch_by_request_length = additional_config.get("batch_by_request_length", False)
 
 
 class TorchairGraphConfig:

@@ -538,8 +538,14 @@ async def _handle_completions(api: str, request: Request):
                         proxy_state.release_prefiller_kv(group_id, prefiller_idx, prefiller_score)
                         released_kv = True
                     yield chunk
-            finally:
-                proxy_state.release_decoder(group_id, decoder_idx, decoder_score)
+            except Exception as e:
+                logger.error(
+                    f"Error during streaming from decoder {decoder.url}: {str(e)} the aborted request {request_id} will be routing to the target prefiller when new request is ready to dispatch to it"
+                )
+                proxy_state.abort_prefiller_request(group_id, prefiller_idx, request_id)
+                proxy_state.release_prefiller_kv(group_id, prefiller_idx, prefiller_score)
+	    # After streaming done, release tokens
+            proxy_state.release_decoder(group_id, decoder_idx, decoder_score)
 
         return StreamingResponse(generate_stream(), media_type="application/json")
 

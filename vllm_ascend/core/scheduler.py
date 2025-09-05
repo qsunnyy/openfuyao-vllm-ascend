@@ -18,6 +18,7 @@ import time
 from collections import deque
 from typing import Iterable, Union
 
+from sortedcontainers import SortedList
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.logger import logger
@@ -86,9 +87,11 @@ class AscendScheduler(Scheduler):
         # and put back at the head of the waiting queue later
         skipped_waiting_requests: deque[Request] = deque()
 
-        batch_by_request_length = get_ascend_config().batch_by_request_length
+        batch_by_request_length = get_ascend_config().ascend_scheduler_config.batch_by_request_length
         if batch_by_request_length:
-            self.waiting = deque(sorted(self.waiting, key=lambda x: x.num_prompt_tokens))
+            request_sort_by_prompt = SortedList(self.waiting, key=lambda x: x.num_prompt_tokens)
+            self.waiting.clear()
+            self.waiting.extend(request_sort_by_prompt)
         # Schedule prefill requests first.
         while self.waiting and token_budget > 0:
             if len(self.running) == self.max_num_running_reqs:

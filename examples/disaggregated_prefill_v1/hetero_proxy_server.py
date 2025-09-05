@@ -90,10 +90,12 @@ import asyncio
 import heapq
 import os
 import sys
+import functools
 from contextlib import asynccontextmanager
 from typing import List
-
+import numpy as np
 import httpx
+import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from vllm.logger import init_logger
@@ -103,6 +105,7 @@ logger = init_logger(__name__)
 # Add uvloop for faster event loop if available
 try:
     import uvloop
+
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 except ImportError:
     pass
@@ -125,6 +128,7 @@ class ServerState:
         self.aborted_requests = set()  # Track aborted requests
         # Removed individual server lock - will use global locks instead
 
+
 class ProxyState:
     def __init__(self, grouped_instances):
         """
@@ -145,13 +149,15 @@ class ProxyState:
             group = {}
             group["prefillers"] = [ServerState(h, p) for h, p, t in g["prefillers"]]
             group["prefillers_tps"] = [t for h, p, t in g["prefillers"]]
-            group["decoders"]   = [ServerState(h, p) for h, p in g["decoders"]]
+            group["decoders"] = [ServerState(h, p) for h, p in g["decoders"]]
             group["prefiller_heap"] = [(0, i, s) for i, s in enumerate(group["prefillers"])]
-            group["decoder_heap"]   = [(0, i, s) for i, s in enumerate(group["decoders"])]
+            group["decoder_heap"] = [(0, i, s) for i, s in enumerate(group["decoders"])]
+            group["lock"] = asyncio.Lock()
             heapq.heapify(group["prefiller_heap"])
             heapq.heapify(group["decoder_heap"])
             self.groups.append(group)
 
+    # ⚡ 更新优先级时带 group_id
     def _update_prefiller_priority(self, group_id: int, server_idx: int):
         group = self.groups[group_id]
         server = group["prefillers"][server_idx]
@@ -192,11 +198,14 @@ class ProxyState:
         async with self.req_id_lock:
             self.req_id_counter += 1
             return str(self.req_id_counter)
+        # return str(uuid.uuid4())
 
-    import numpy as np
-
-    def select_group(self, request_length: int, alpha: float = 1.0, beta: float = 3.0,
-                     bucket_seperate_length: int = 2048):
+    def select_group_hetero(self, request_length: int, alpha: float = 1.0, beta: float = 3.0,
+                     bucket_seperate_length: int = 1024):
+        """
+        遍历所有 group，按 score 公式计算，返回 score 最小的 group_id。
+        使用向量化提高计算速度。
+        """
         n_groups = len(self.groups)
         tp_sums = np.array([sum(g["prefillers_tps"]) for g in self.groups], dtype=np.float64)
         active_tokens_sums = np.array([sum(s.active_tokens for s in g["prefillers"]) for g in self.groups],
@@ -204,40 +213,62 @@ class ProxyState:
 
         total_tp_sum = tp_sums.sum()
         total_active_tokens = active_tokens_sums.sum() + 1e-6
-        tp_factors =  tp_sums / total_tp_sum - 1 / n_groups
+        tp_factors = tp_sums / total_tp_sum - 1 / n_groups
         tp_factors *= (1 - request_length / bucket_seperate_length)
         score_factors = alpha * (active_tokens_sums / total_active_tokens) + beta * tp_factors
 
         for gid, score in enumerate(score_factors):
             print(
-                f"===Group {gid}: score={score:.6f}, request_length={request_length}, tp_sum={tp_sums[gid]}, active_tokens={active_tokens_sums[gid]}===")
+                f"Group {gid}: score={score:.6f}, request_length={request_length}, tp_sum={tp_sums[gid]}, active_tokens={active_tokens_sums[gid]}")
 
         best_group_id = int(np.argmin(score_factors))
-        print(f"===Selected group: {best_group_id}, min_score={score_factors[best_group_id]:.6f}===")
+        print(f"==============Selected group: {best_group_id}, min_score={score_factors[best_group_id]:.6f}===========")
         return best_group_id
 
 
-    def select_prefiller(self, group_id: int, token_count: int):
-        group = self.groups[group_id]
-        if not group["prefiller_heap"]:
-            raise RuntimeError("No prefiller servers available in group")
+    def select_group_baseline(self, request_length: int):
+        """
+        Baseline using min-prefiller-heap priority.
+        """
+        min_priority = float('inf')
+        chosen_gid = None
+        for gid, group in enumerate(self.groups):
+            if group["prefiller_heap"]:
+                priority, _, _ = group["prefiller_heap"][0]
+                if priority < min_priority:
+                    min_priority = priority
+                    chosen_gid = gid
+        if chosen_gid is None:
+            raise RuntimeError("No available prefiller in any group")
+        print(f"Baseline selected group: {chosen_gid} (min heap priority={min_priority})")
+        return chosen_gid
 
-        priority, chosen, server = heapq.heappop(group["prefiller_heap"])
-        server.active_tokens += token_count
-        server.active_kv_cache += token_count
-        self._update_prefiller_priority(group_id, chosen)
-        return chosen
 
-    def release_prefiller(self, group_id: int, idx: int, token_count: int):
+    async def select_prefiller(self, group_id: int, token_count: int):
         group = self.groups[group_id]
-        group["prefillers"][idx].active_tokens -= token_count
-        self._update_prefiller_priority(group_id, idx)
+        async with group["lock"]:
+            if not group["prefiller_heap"]:
+                raise RuntimeError("No prefiller servers available in group")
 
-    def release_prefiller_kv(self, group_id: int, idx: int, token_count: int):
+            priority, chosen, server = heapq.heappop(group["prefiller_heap"])
+            server.active_tokens += token_count
+            server.active_kv_cache += token_count
+            self._update_prefiller_priority(group_id, chosen)
+            return chosen
+
+    async def release_prefiller(self, group_id: int, idx: int, token_count: int):
         group = self.groups[group_id]
-        if group["prefillers"][idx].active_kv_cache > 0:
-            group["prefillers"][idx].active_kv_cache -= token_count
-        self._update_prefiller_priority(group_id, idx)
+        async with group["lock"]:
+            group["prefillers"][idx].active_tokens -= token_count
+            self._update_prefiller_priority(group_id, idx)
+
+    async def release_prefiller_kv(self, group_id: int, idx: int, token_count: int):
+        group = self.groups[group_id]
+        async with group["lock"]:
+            if group["prefillers"][idx].active_kv_cache > 0:
+                group["prefillers"][idx].active_kv_cache -= token_count
+            self._update_prefiller_priority(group_id, idx)
+
 
     def select_decoder(self, group_id: int, token_count: int):
         group = self.groups[group_id]
@@ -254,13 +285,7 @@ class ProxyState:
         group["decoders"][idx].active_tokens -= token_count
         self._update_decoder_priority(group_id, idx)
 
-    # request_length = 10 → 120.16
-    # request_length = 100 → 120.94
-    # request_length = 1000 → 128.70
-    # request_length = 5000 → 163.20
-    # request_length = 10000 → 206.32
-    # request_length = 20000 → 292.57
-    # 分数函数保持不变
+
     def calculate_prefill_scores(self, request_length: int) -> float:
         length_score = request_length / 4.0
         return length_score * 0.0345 + 120.0745
@@ -297,6 +322,9 @@ def parse_args():
                         type=int,
                         default=3,
                         help="Maximum number of retries for HTTP requests")
+    parser.add_argument("--enable-hetero-bucket",
+                        action="store_true",
+                        help="Enable the special feature")
     parser.add_argument(
         "--retry-delay",
         type=float,
@@ -325,16 +353,14 @@ def parse_args():
             zip(args.decoder_hosts, args.decoder_ports)
         )
     ]
-    
+
     return args
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global proxy_state
-
-    print("----------------------------global_argsgrouped_instances:",global_args.grouped_instances)
-    
+    print("----------------------------global_argsgrouped_instances:", global_args.grouped_instances)
     proxy_state = ProxyState(global_args.grouped_instances)
     print(
         f"Initialized {len(proxy_state.groups)} pd groups"
@@ -347,6 +373,30 @@ async def lifespan(app: FastAPI):
         for d in group["decoders"]:
             await d.client.aclose()
 
+
+async def listen_for_disconnect(request: Request) -> None:
+    """Return if a disconnect message is received"""
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            break
+
+
+def with_cancellation(handler_func):
+
+    @functools.wraps(handler_func)
+    async def wrapper(*args, **kwargs):
+        request = kwargs["request"]
+        handler_task = asyncio.create_task(handler_func(*args, **kwargs))
+        cancellation_task = asyncio.create_task(listen_for_disconnect(request))
+        done, pending = await asyncio.wait([handler_task, cancellation_task],
+                                           return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        if handler_task in done:
+            return handler_task.result()
+        return None
+    return wrapper
 
 app = FastAPI(lifespan=lifespan)
 
@@ -365,7 +415,6 @@ async def send_request_to_service(client: httpx.AsyncClient,
     req_data['kv_transfer_params'] = {
         "do_remote_decode": True,
         "do_remote_prefill": False,
-        #"do_remote_prefill": True,
         "remote_engine_id": None,
         "remote_block_ids": None,
         "remote_host": None,
@@ -386,7 +435,7 @@ async def send_request_to_service(client: httpx.AsyncClient,
             response = await client.post(endpoint,
                                          json=req_data,
                                          headers=headers,
-                                         timeout=5.0)
+                                         timeout=60)
             response.raise_for_status()
             return response
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
@@ -394,7 +443,7 @@ async def send_request_to_service(client: httpx.AsyncClient,
                 f"Attempt {attempt} failed for {endpoint}: {str(e)}")
             last_exc = e
             if attempt < max_retries:
-                await asyncio.sleep(base_delay * (2**(attempt - 1)))
+                await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
             else:
                 logger.error(
                     f"All {max_retries} attempts failed for {endpoint}.")
@@ -428,7 +477,7 @@ async def stream_service_response_with_retry(client: httpx.AsyncClient,
                 logger.warning(
                     f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}"
                 )
-                await asyncio.sleep(base_delay * (2**(attempt - 1)))
+                await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
             else:
                 logger.error(
                     f"All {max_retries} attempts failed for streaming {endpoint}."
@@ -446,12 +495,13 @@ async def stream_service_response_with_retry(client: httpx.AsyncClient,
                     logger.warning(
                         f"Attempt {attempt} failed for streaming {endpoint}: {str(e)}"
                     )
-                    await asyncio.sleep(base_delay * (2**(attempt - 1)))
+                    await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
                 else:
                     logger.error(
                         f"All {max_retries} attempts failed for streaming {endpoint}."
                     )
                     raise e
+
 
 async def _handle_completions(api: str, request: Request):
     try:
@@ -462,11 +512,24 @@ async def _handle_completions(api: str, request: Request):
         request_id = await proxy_state.next_req_id()
 
         # 选择hetero group
-        group_id = proxy_state.select_group(request_length)
+        # hetero_bucket = get_ascend_config().hetero_bucket
+
+        print(f"=======================global_args.enable_hetero_bucket:{global_args.enable_hetero_bucket}==============================")
+        if global_args.enable_hetero_bucket:
+            group_id = proxy_state.select_group_hetero(request_length)
+        else:
+            group_id = proxy_state.select_group_baseline(request_length)
 
         # 选择 prefiller
-        prefiller_idx = proxy_state.select_prefiller(group_id, prefiller_score)
+        # prefiller_idx = proxy_state.select_prefiller(group_id, prefiller_score)
+        prefiller_idx = await proxy_state.select_prefiller(group_id, prefiller_score)
         prefiller = proxy_state.groups[group_id]["prefillers"][prefiller_idx]
+
+        if "max_completion_tokens" in req_data:
+            req_data.pop("max_completion_tokens")
+            req_data["max_tokens"] = 256
+
+
 
         response = await send_request_to_service(
             prefiller.client,
@@ -478,7 +541,8 @@ async def _handle_completions(api: str, request: Request):
             max_retries=global_args.max_retries,
             base_delay=global_args.retry_delay
         )
-        proxy_state.release_prefiller(group_id, prefiller_idx, prefiller_score)
+        #proxy_state.release_prefiller(group_id, prefiller_idx, prefiller_score)
+        await proxy_state.release_prefiller_kv(group_id, prefiller_idx, prefiller_score)
 
         response_json = response.json()
         kv_transfer_params = response_json.get("kv_transfer_params", {})
@@ -494,17 +558,26 @@ async def _handle_completions(api: str, request: Request):
             released_kv = False
             try:
                 async for chunk in stream_service_response_with_retry(
-                    decoder.client,
-                    api,
-                    req_data,
-                    request_id=request_id,
-                    max_retries=global_args.max_retries,
-                    base_delay=global_args.retry_delay
+                        decoder.client,
+                        api,
+                        req_data,
+                        request_id=request_id,
+                        max_retries=global_args.max_retries,
+                        base_delay=global_args.retry_delay
                 ):
                     if not released_kv and chunk:
-                        proxy_state.release_prefiller_kv(group_id, prefiller_idx, prefiller_score)
+                        # proxy_state.release_prefiller_kv(group_id, prefiller_idx, prefiller_score)
+                        await proxy_state.release_prefiller_kv(group_id, prefiller_idx, prefiller_score)
                         released_kv = True
                     yield chunk
+            except Exception as e:
+                logger.error(
+                    f"Error during streaming from decoder {decoder.url}: {str(e)} the aborted request {request_id} will be routing to the target prefiller when new request is ready to dispatch to it"
+                )
+                proxy_state.abort_prefiller_request(group_id, prefiller_idx, request_id)
+                # proxy_state.release_prefiller_kv(group_id, prefiller_idx, prefiller_score)
+                await proxy_state.release_prefiller_kv(group_id, prefiller_idx, prefiller_score)
+            # After streaming done, release tokens
             finally:
                 proxy_state.release_decoder(group_id, decoder_idx, decoder_score)
 
@@ -519,12 +592,15 @@ async def _handle_completions(api: str, request: Request):
         print("".join(traceback.format_exception(*exc_info)))
         raise
 
+
 @app.post("/v1/completions")
+@with_cancellation
 async def handle_completions(request: Request):
     return await _handle_completions("/completions", request)
 
 
 @app.post("/v1/chat/completions")
+@with_cancellation
 async def handle_chat_completions(request: Request):
     return await _handle_completions("/chat/completions", request)
 
@@ -533,8 +609,8 @@ async def handle_chat_completions(request: Request):
 async def healthcheck():
     return {
         "status": "ok",
-        "prefill_instances": len(proxy_state.prefillers),
-        "decode_instances": len(proxy_state.decoders)
+        "prefill_instances": sum(len(g["prefillers"]) for g in proxy_state.groups),
+        "decode_instances": sum(len(g["decoders"]) for g in proxy_state.groups)
     }
 
 
@@ -542,4 +618,5 @@ if __name__ == '__main__':
     global global_args
     global_args = parse_args()
     import uvicorn
+
     uvicorn.run(app, host=global_args.host, port=global_args.port)

@@ -125,6 +125,7 @@ class AscendSchedulerConfig:
     def __init__(self, ascend_scheduler_config: dict):
         self.enabled = ascend_scheduler_config.get("enabled", False)
         self.batch_by_request_length = ascend_scheduler_config.get("batch_by_request_length", False)
+        logger.info(f"Ascend scheduler enabled: {self.enabled}, batch by request length: {self.batch_by_request_length}")
         # Ascend scheduler is based on vllm v0 scheduler, so we should support
         # all vllm v0 scheduler configs as well.
         for k, v in ascend_scheduler_config.items():
